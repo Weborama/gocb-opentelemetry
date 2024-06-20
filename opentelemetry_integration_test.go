@@ -2,16 +2,17 @@ package gocbopentelemetry
 
 import (
 	"context"
-	"flag"
 	"fmt"
-	"os"
 	"sort"
 	"testing"
 	"time"
 
 	"github.com/couchbase/gocb/v2"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/couchbase"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/metric"
@@ -20,37 +21,59 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
-func envFlagString(envName, name, value, usage string) *string {
-	envValue := os.Getenv(envName)
-	if envValue != "" {
-		value = envValue
+const bucketName = "testBucket"
+
+var (
+	user             = ""
+	password         = ""
+	connectionString = ""
+)
+
+func setupCouchbaseContainer(t *testing.T) (doneFunc func()) {
+	ctx := context.Background()
+
+	bucket := couchbase.NewBucket(bucketName)
+
+	bucket = bucket.WithQuota(100).
+		WithReplicas(0).
+		WithFlushEnabled(false).
+		WithPrimaryIndex(true)
+
+	couchbaseContainer, err := couchbase.RunContainer(ctx,
+		testcontainers.WithImage("couchbase:latest"),
+		couchbase.WithAdminCredentials("testcontainers", "testcontainers.IS.cool!"),
+		couchbase.WithBuckets(bucket),
+	)
+	if err != nil {
+		t.Fatalf("failed to start container: %s", err)
 	}
-	return flag.String(name, value, usage)
+
+	doneFunc = func() {
+		if err := couchbaseContainer.Terminate(ctx); err != nil {
+			t.Fatalf("failed to terminate container: %s", err)
+		}
+	}
+
+	connectionString, err = couchbaseContainer.ConnectionString(ctx)
+	if err != nil {
+		t.Fatalf("failed to get a connection string: %s", err)
+	}
+
+	user = couchbaseContainer.Username()
+	password = couchbaseContainer.Password()
+
+	return doneFunc
 }
 
-var server, user, password, bucket string
+func TestOpenTelemetry(t *testing.T) {
 
-func TestMain(m *testing.M) {
-	serverFlag := envFlagString("GOCBSERVER", "server", "localhost",
-		"The connection string to connect to for a real server")
-	userFlag := envFlagString("GOCBUSER", "user", "Administrator",
-		"The username to use to authenticate when using a real server")
-	passwordFlag := envFlagString("GOCBPASS", "pass", "password",
-		"The password to use to authenticate when using a real server")
-	bucketFlag := envFlagString("GOCBBUCKET", "bucket", "default",
-		"The bucket to use to test against")
-	flag.Parse()
-
-	server = *serverFlag
-	user = *userFlag
-	password = *passwordFlag
-	bucket = *bucketFlag
-
-	result := m.Run()
-	os.Exit(result)
+	doneFunc := setupCouchbaseContainer(t)
+	defer doneFunc()
+	t.Run("tracer", testOpenTelemetryTracer)
+	t.Run("meter", testOpenTelemetryMeter)
 }
 
-func TestOpenTelemetryTracer(t *testing.T) {
+func testOpenTelemetryTracer(t *testing.T) {
 	gocb.SetLogger(gocb.VerboseStdioLogger())
 	ctx := context.Background()
 	exporter := tracetest.NewInMemoryExporter()
@@ -63,7 +86,7 @@ func TestOpenTelemetryTracer(t *testing.T) {
 
 	tracer := tp.Tracer("test-demo")
 
-	cluster, err := gocb.Connect(server, gocb.ClusterOptions{
+	cluster, err := gocb.Connect(connectionString, gocb.ClusterOptions{
 		Authenticator: gocb.PasswordAuthenticator{
 			Username: user,
 			Password: password,
@@ -73,7 +96,7 @@ func TestOpenTelemetryTracer(t *testing.T) {
 	require.Nil(t, err)
 	defer cluster.Close(nil)
 
-	b := cluster.Bucket(bucket)
+	b := cluster.Bucket(bucketName)
 	err = b.WaitUntilReady(5*time.Second, nil)
 	require.Nil(t, err, err)
 
@@ -187,7 +210,7 @@ func TestOpenTelemetryTracer(t *testing.T) {
 	})
 }
 
-func TestOpenTelemetryMeter(t *testing.T) {
+func testOpenTelemetryMeter(t *testing.T) {
 	gocb.SetLogger(gocb.VerboseStdioLogger())
 
 	rdr := metric.NewManualReader()
@@ -196,7 +219,7 @@ func TestOpenTelemetryMeter(t *testing.T) {
 		metric.WithReader(rdr),
 	)
 
-	cluster, err := gocb.Connect(server, gocb.ClusterOptions{
+	cluster, err := gocb.Connect(connectionString, gocb.ClusterOptions{
 		Authenticator: gocb.PasswordAuthenticator{
 			Username: user,
 			Password: password,
@@ -206,7 +229,7 @@ func TestOpenTelemetryMeter(t *testing.T) {
 	require.Nil(t, err)
 	defer cluster.Close(nil)
 
-	b := cluster.Bucket(bucket)
+	b := cluster.Bucket(bucketName)
 	err = b.WaitUntilReady(5*time.Second, nil)
 	require.Nil(t, err, err)
 
@@ -227,8 +250,9 @@ func TestOpenTelemetryMeter(t *testing.T) {
 	histogram, ok := data.ScopeMetrics[0].Metrics[0].Data.(metricdata.Histogram[int64])
 	require.True(t, ok)
 
-	assertOTMetric(t, histogram.DataPoints[0], "upsert")
-	assertOTMetric(t, histogram.DataPoints[1], "get")
+	assertOTMetricServiceKey(t, histogram.DataPoints)
+	assertOTMetricName(t, histogram.DataPoints, "upsert")
+	assertOTMetricName(t, histogram.DataPoints, "get")
 }
 
 func assertOTSpan(t *testing.T, span tracetest.SpanStub, name string, attribs []attribute.KeyValue) {
@@ -255,18 +279,33 @@ func assertOTSpan(t *testing.T, span tracetest.SpanStub, name string, attribs []
 	}
 }
 
-func assertOTMetric(t *testing.T, metric metricdata.HistogramDataPoint[int64], name string) {
-	require.EqualValues(t, metric.Attributes.Len(), 2)
-	expectedKeys := []attribute.KeyValue{
-		attribute.String("db.couchbase.service", "kv"),
-		attribute.String("db.operation", name),
-	}
+func assertOTMetricServiceKey(t *testing.T, metrics []metricdata.HistogramDataPoint[int64]) {
+	expectedKey := attribute.String("db.couchbase.service", "kv")
+	for _, metric := range metrics {
+		require.EqualValues(t, metric.Attributes.Len(), 2)
 
-	for _, val := range expectedKeys {
-		v, found := metric.Attributes.Value(val.Key)
+		v, found := metric.Attributes.Value(expectedKey.Key)
 		assert.True(t, found)
-		assert.Equal(t, val.Value, v)
+		assert.Equal(t, expectedKey.Value, v)
 	}
+}
 
-	require.EqualValues(t, metric.Count, 1)
+func assertOTMetricName(t *testing.T, metrics []metricdata.HistogramDataPoint[int64], name string) {
+	var (
+		foundValue attribute.Value
+		found      bool
+	)
+
+	expectedKey := attribute.String("db.operation", name)
+
+	for _, metric := range metrics {
+		require.EqualValues(t, metric.Attributes.Len(), 2)
+
+		foundValue, found = metric.Attributes.Value(expectedKey.Key)
+		if found && foundValue.AsString() == name {
+			break
+		}
+		require.EqualValues(t, metric.Count, 1)
+	}
+	assert.Equal(t, expectedKey.Value, foundValue)
 }
