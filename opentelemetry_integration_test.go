@@ -1,20 +1,18 @@
 package gocbopentelemetry
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"sort"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/couchbase/gocb/v2"
-	"github.com/ory/dockertest/v3"
-	"github.com/ory/dockertest/v3/docker"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/couchbase"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/metric"
@@ -23,171 +21,54 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
-var ( // nolint: gochecknoglobals
-	user               = "couchbase"
-	password           = "couchbase"
-	integrationCleanup func() error
-	integrationOnce    sync.Once
-	bucketMetrics      = ""
-	bucketTracer       = ""
-	server             = ""
+const bucketName = "testBucket"
+
+var (
+	user             = ""
+	password         = ""
+	connectionString = ""
 )
 
-func TestMain(m *testing.M) {
-	code := m.Run()
-	if integrationCleanup != nil {
-		if err := integrationCleanup(); err != nil {
-			panic(err)
+func setupCouchbaseContainer(t *testing.T) (doneFunc func()) {
+	ctx := context.Background()
+
+	bucket := couchbase.NewBucket(bucketName)
+
+	bucket = bucket.WithQuota(100).
+		WithReplicas(0).
+		WithFlushEnabled(false).
+		WithPrimaryIndex(true)
+
+	couchbaseContainer, err := couchbase.RunContainer(ctx,
+		testcontainers.WithImage("couchbase:latest"),
+		couchbase.WithAdminCredentials("testcontainers", "testcontainers.IS.cool!"),
+		couchbase.WithBuckets(bucket),
+	)
+	if err != nil {
+		t.Fatalf("failed to start container: %s", err)
+	}
+
+	doneFunc = func() {
+		if err := couchbaseContainer.Terminate(ctx); err != nil {
+			t.Fatalf("failed to terminate container: %s", err)
 		}
 	}
 
-	os.Exit(code)
-}
-
-func requireCouchbase(tb testing.TB) {
-	integrationOnce.Do(func() {
-		pool, resource, err := setupCouchbase(tb)
-		require.NoError(tb, err)
-
-		port := resource.GetPort("11210/tcp")
-		integrationCleanup = func() error {
-			return pool.Purge(resource)
-		}
-
-		server = fmt.Sprintf("couchbase://localhost:%v", port)
-		bucketMetrics = fmt.Sprintf("testing-couchbase-metrics-%d", time.Now().Unix())
-		require.NoError(tb, createBucket(context.Background(), tb, bucketMetrics))
-		tb.Cleanup(func() {
-			require.NoError(tb, removeBucket(context.Background(), tb, bucketMetrics))
-		})
-
-		bucketTracer = fmt.Sprintf("testing-couchbase-tracer-%d", time.Now().Unix())
-		require.NoError(tb, createBucket(context.Background(), tb, bucketTracer))
-		tb.Cleanup(func() {
-			require.NoError(tb, removeBucket(context.Background(), tb, bucketTracer))
-		})
-	})
-
-}
-
-func setupCouchbase(tb testing.TB) (*dockertest.Pool, *dockertest.Resource, error) {
-	tb.Log("setup couchbase cluster")
-
-	pool, err := dockertest.NewPool("")
+	connectionString, err = couchbaseContainer.ConnectionString(ctx)
 	if err != nil {
-		return nil, nil, err
+		t.Fatalf("failed to get a connection string: %s", err)
 	}
 
-	pwd, err := os.Getwd()
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get working directory: %w", err)
-	}
+	user = couchbaseContainer.Username()
+	password = couchbaseContainer.Password()
 
-	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository: "couchbase",
-		Tag:        "latest",
-		Cmd:        []string{"/opt/couchbase/configure-server.sh"},
-		Env: []string{
-			"CLUSTER_NAME=couchbase",
-			fmt.Sprintf("COUCHBASE_ADMINISTRATOR_USERNAME=%s", user),
-			fmt.Sprintf("COUCHBASE_ADMINISTRATOR_PASSWORD=%s", password),
-		},
-		Mounts: []string{
-			fmt.Sprintf("%s/configure-server.sh:/opt/couchbase/configure-server.sh", pwd),
-		},
-		PortBindings: map[docker.Port][]docker.PortBinding{
-			"8091/tcp": {
-				{
-					HostIP: "0.0.0.0", HostPort: "8091",
-				},
-			},
-			"11210/tcp": {
-				{
-					HostIP: "0.0.0.0", HostPort: "11210",
-				},
-			},
-		},
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Look for readyness
-	var stderr bytes.Buffer
-	time.Sleep(15 * time.Second)
-	for range 5 {
-		time.Sleep(time.Second)
-		exitCode, err := resource.Exec([]string{"/usr/bin/cat", "/is-ready"}, dockertest.ExecOptions{
-			StdErr: &stderr, // without stderr exit code is not reported
-		})
-		if exitCode == 0 && err == nil {
-			break
-		}
-		tb.Log(err)
-	}
-
-	tb.Log("couchbase cluster ready")
-
-	return pool, resource, nil
-}
-
-func createBucket(_ context.Context, _ testing.TB, bucket string) error {
-	cluster, err := gocb.Connect(server, gocb.ClusterOptions{
-		Authenticator: gocb.PasswordAuthenticator{
-			Username: user,
-			Password: password,
-		},
-	})
-	if err != nil {
-		return err
-	}
-
-	err = cluster.WaitUntilReady(time.Second*10, nil)
-	if err != nil {
-		return err
-	}
-
-	err = cluster.Buckets().CreateBucket(gocb.CreateBucketSettings{
-		BucketSettings: gocb.BucketSettings{
-			Name:       bucket,
-			RAMQuotaMB: 100, // smallest value and allow max 10 running bucket with cluster-ramsize 1024 from setup script
-			BucketType: gocb.CouchbaseBucketType,
-		},
-	}, nil)
-	if err != nil {
-		return err
-	}
-
-	for range 5 { // try five time
-		time.Sleep(time.Second)
-		err = cluster.Bucket(bucket).WaitUntilReady(time.Second*10, nil)
-		if err == nil {
-			break
-		}
-	}
-
-	return err
-}
-
-func removeBucket(ctx context.Context, _ testing.TB, bucket string) error {
-	cluster, err := gocb.Connect(server, gocb.ClusterOptions{
-		Authenticator: gocb.PasswordAuthenticator{
-			Username: user,
-			Password: password,
-		},
-	})
-	if err != nil {
-		return err
-	}
-
-	return cluster.Buckets().DropBucket(bucket, &gocb.DropBucketOptions{
-		Context: ctx,
-	})
+	return doneFunc
 }
 
 func TestOpenTelemetry(t *testing.T) {
-	requireCouchbase(t)
 
+	doneFunc := setupCouchbaseContainer(t)
+	defer doneFunc()
 	t.Run("tracer", testOpenTelemetryTracer)
 	t.Run("meter", testOpenTelemetryMeter)
 }
@@ -205,7 +86,7 @@ func testOpenTelemetryTracer(t *testing.T) {
 
 	tracer := tp.Tracer("test-demo")
 
-	cluster, err := gocb.Connect(server, gocb.ClusterOptions{
+	cluster, err := gocb.Connect(connectionString, gocb.ClusterOptions{
 		Authenticator: gocb.PasswordAuthenticator{
 			Username: user,
 			Password: password,
@@ -215,7 +96,7 @@ func testOpenTelemetryTracer(t *testing.T) {
 	require.Nil(t, err)
 	defer cluster.Close(nil)
 
-	b := cluster.Bucket(bucketTracer)
+	b := cluster.Bucket(bucketName)
 	err = b.WaitUntilReady(5*time.Second, nil)
 	require.Nil(t, err, err)
 
@@ -338,7 +219,7 @@ func testOpenTelemetryMeter(t *testing.T) {
 		metric.WithReader(rdr),
 	)
 
-	cluster, err := gocb.Connect(server, gocb.ClusterOptions{
+	cluster, err := gocb.Connect(connectionString, gocb.ClusterOptions{
 		Authenticator: gocb.PasswordAuthenticator{
 			Username: user,
 			Password: password,
@@ -348,7 +229,7 @@ func testOpenTelemetryMeter(t *testing.T) {
 	require.Nil(t, err)
 	defer cluster.Close(nil)
 
-	b := cluster.Bucket(bucketMetrics)
+	b := cluster.Bucket(bucketName)
 	err = b.WaitUntilReady(5*time.Second, nil)
 	require.Nil(t, err, err)
 
@@ -369,9 +250,9 @@ func testOpenTelemetryMeter(t *testing.T) {
 	histogram, ok := data.ScopeMetrics[0].Metrics[0].Data.(metricdata.Histogram[int64])
 	require.True(t, ok)
 
-	assertOTMetric(t, histogram.DataPoints[1], "get")
-	assertOTMetric(t, histogram.DataPoints[0], "upsert")
-
+	assertOTMetricServiceKey(t, histogram.DataPoints)
+	assertOTMetricName(t, histogram.DataPoints, "upsert")
+	assertOTMetricName(t, histogram.DataPoints, "get")
 }
 
 func assertOTSpan(t *testing.T, span tracetest.SpanStub, name string, attribs []attribute.KeyValue) {
@@ -398,18 +279,33 @@ func assertOTSpan(t *testing.T, span tracetest.SpanStub, name string, attribs []
 	}
 }
 
-func assertOTMetric(t *testing.T, metric metricdata.HistogramDataPoint[int64], name string) {
-	require.EqualValues(t, metric.Attributes.Len(), 2)
-	expectedKeys := []attribute.KeyValue{
-		attribute.String("db.couchbase.service", "kv"),
-		attribute.String("db.operation", name),
-	}
+func assertOTMetricServiceKey(t *testing.T, metrics []metricdata.HistogramDataPoint[int64]) {
+	expectedKey := attribute.String("db.couchbase.service", "kv")
+	for _, metric := range metrics {
+		require.EqualValues(t, metric.Attributes.Len(), 2)
 
-	for _, val := range expectedKeys {
-		v, found := metric.Attributes.Value(val.Key)
+		v, found := metric.Attributes.Value(expectedKey.Key)
 		assert.True(t, found)
-		assert.Equal(t, val.Value, v)
+		assert.Equal(t, expectedKey.Value, v)
 	}
+}
 
-	require.EqualValues(t, metric.Count, 1)
+func assertOTMetricName(t *testing.T, metrics []metricdata.HistogramDataPoint[int64], name string) {
+	var (
+		foundValue attribute.Value
+		found      bool
+	)
+
+	expectedKey := attribute.String("db.operation", name)
+
+	for _, metric := range metrics {
+		require.EqualValues(t, metric.Attributes.Len(), 2)
+
+		foundValue, found = metric.Attributes.Value(expectedKey.Key)
+		if found && foundValue.AsString() == name {
+			break
+		}
+		require.EqualValues(t, metric.Count, 1)
+	}
+	assert.Equal(t, expectedKey.Value, foundValue)
 }
